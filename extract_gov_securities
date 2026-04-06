@@ -1,0 +1,267 @@
+"""
+Government Securities Trade Summary - PDF to Excel/CSV Extractor
+================================================================
+STEP-BY-STEP USAGE:
+  1. Install requirements:     pip install pdfplumber openpyxl pandas
+  2. Put your PDF(s) in the same folder as this script
+  3. Run:  python extract_gov_securities.py
+  4. Output files will be saved in the same folder
+
+For multiple PDFs (time series):
+  - Put ALL daily PDFs in one folder
+  - The script auto-combines them with a Date column
+"""
+
+import os
+import glob
+import re
+import pdfplumber
+import pandas as pd
+from openpyxl import load_workbook
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
+from datetime import datetime
+
+
+# ─────────────────────────────────────────────
+# CONFIGURATION – change these if needed
+# ─────────────────────────────────────────────
+PDF_FOLDER    = "."          # Folder where your PDFs are (. = same folder as script)
+OUTPUT_EXCEL  = "gov_securities_data.xlsx"
+OUTPUT_CSV    = "gov_securities_data.csv"
+# ─────────────────────────────────────────────
+
+
+def extract_date_from_pdf(pdf_path: str) -> str:
+    """Try to extract the report date from the PDF filename or content."""
+    # Try filename first  e.g. "trade_summary_2025-11-28.pdf"
+    date_match = re.search(r'(\d{4}[-_]\d{2}[-_]\d{2})', os.path.basename(pdf_path))
+    if date_match:
+        return date_match.group(1).replace("_", "-")
+
+    # Try reading from first page text
+    with pdfplumber.open(pdf_path) as pdf:
+        first_page_text = pdf.pages[0].extract_text() or ""
+        # Look for date patterns like "28/11/2025" or "November 28, 2025"
+        m = re.search(r'(\d{2})[/.-](\d{2})[/.-](\d{4})', first_page_text)
+        if m:
+            return f"{m.group(3)}-{m.group(2)}-{m.group(1)}"
+        m = re.search(r'(\d{4})[/.-](\d{2})[/.-](\d{2})', first_page_text)
+        if m:
+            return f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
+
+    # Fall back to file modification date
+    mtime = os.path.getmtime(pdf_path)
+    return datetime.fromtimestamp(mtime).strftime("%Y-%m-%d")
+
+
+def extract_tables_from_pdf(pdf_path: str) -> pd.DataFrame:
+    """Extract all table data from a single PDF file."""
+    date_str = extract_date_from_pdf(pdf_path)
+    all_rows = []
+
+    with pdfplumber.open(pdf_path) as pdf:
+        for page_num, page in enumerate(pdf.pages, 1):
+            # Extract tables with generous settings to catch varied layouts
+            tables = page.extract_tables({
+                "vertical_strategy":   "lines",
+                "horizontal_strategy": "lines",
+                "snap_tolerance":       5,
+                "join_tolerance":       3,
+                "min_words_vertical":   1,
+            })
+
+            if not tables:
+                # Fallback: try text extraction and parse manually
+                tables = page.extract_tables()
+
+            for table in tables:
+                if not table or len(table) < 2:
+                    continue
+
+                # Detect header row (contains recognizable column names)
+                header_row_idx = None
+                for i, row in enumerate(table):
+                    row_text = " ".join(str(c).lower() for c in row if c)
+                    if any(kw in row_text for kw in ["isin", "yield", "tenure", "volume", "security"]):
+                        header_row_idx = i
+                        break
+
+                if header_row_idx is None:
+                    continue
+
+                headers = [str(h).strip().replace("\n", " ") if h else f"Col{j}"
+                           for j, h in enumerate(table[header_row_idx])]
+
+                for row in table[header_row_idx + 1:]:
+                    if not row or all(c is None or str(c).strip() == "" for c in row):
+                        continue
+                    record = {"Date": date_str, "Source_File": os.path.basename(pdf_path)}
+                    for header, cell in zip(headers, row):
+                        record[header] = str(cell).strip() if cell is not None else ""
+                    all_rows.append(record)
+
+    return pd.DataFrame(all_rows)
+
+
+def clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    """Standardise column names and convert numeric columns."""
+    # Rename columns to standard names (fuzzy match)
+    rename_map = {}
+    col_patterns = {
+        "ISIN":                   ["isin"],
+        "Security_Type":          ["security type", "security", "type"],
+        "Tenure":                 ["tenure", "maturity"],
+        "Opening_Yield":          ["opening", "open yield"],
+        "Closing_Yield":          ["closing", "close yield"],
+        "Highest_Yield":          ["highest", "high yield"],
+        "Lowest_Yield":           ["lowest", "low yield"],
+        "Weighted_Avg_Yield":     ["weighted", "wa yield", "wav"],
+        "Volume":                 ["volume", "vol"],
+        "Number_of_Trades":       ["number of trades", "no. of", "trades"],
+    }
+    for std_name, patterns in col_patterns.items():
+        for col in df.columns:
+            if any(p in col.lower() for p in patterns):
+                rename_map[col] = std_name
+                break
+
+    df = df.rename(columns=rename_map)
+
+    # Convert numeric columns
+    numeric_cols = ["Tenure", "Opening_Yield", "Closing_Yield",
+                    "Highest_Yield", "Lowest_Yield", "Weighted_Avg_Yield", "Volume", "Number_of_Trades"]
+    for col in numeric_cols:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col].astype(str).str.replace(",", ""), errors="coerce")
+
+    # Convert Date
+    if "Date" in df.columns:
+        df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+
+    # Drop completely empty rows
+    df = df.dropna(how="all")
+
+    # Reorder columns: Date first, then standard cols, then anything else
+    standard_order = ["Date", "ISIN", "Security_Type", "Tenure",
+                      "Opening_Yield", "Closing_Yield", "Highest_Yield",
+                      "Lowest_Yield", "Weighted_Avg_Yield", "Volume", "Number_of_Trades"]
+    existing   = [c for c in standard_order if c in df.columns]
+    remaining  = [c for c in df.columns if c not in standard_order]
+    df = df[existing + remaining]
+
+    return df.reset_index(drop=True)
+
+
+def style_excel(path: str):
+    """Apply professional formatting to the Excel output."""
+    wb = load_workbook(path)
+    ws = wb.active
+
+    # Header style
+    header_fill   = PatternFill("solid", start_color="1F497D", end_color="1F497D")
+    header_font   = Font(bold=True, color="FFFFFF", name="Arial", size=10)
+    header_align  = Alignment(horizontal="center", vertical="center", wrap_text=True)
+
+    # Alternating row fill
+    alt_fill = PatternFill("solid", start_color="DCE6F1", end_color="DCE6F1")
+
+    thin = Side(style="thin", color="BBBBBB")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+    # Apply header formatting
+    for cell in ws[1]:
+        cell.font      = header_font
+        cell.fill      = header_fill
+        cell.alignment = header_align
+        cell.border    = border
+
+    # Apply row formatting
+    for row_idx, row in enumerate(ws.iter_rows(min_row=2), start=2):
+        fill = alt_fill if row_idx % 2 == 0 else None
+        for cell in row:
+            if fill:
+                cell.fill = fill
+            cell.border = border
+            cell.font   = Font(name="Arial", size=9)
+            cell.alignment = Alignment(horizontal="center")
+
+    # Auto column widths
+    for col in ws.columns:
+        max_len = max((len(str(c.value)) for c in col if c.value), default=10)
+        ws.column_dimensions[get_column_letter(col[0].column)].width = min(max_len + 4, 30)
+
+    # Freeze header row
+    ws.freeze_panes = "A2"
+
+    wb.save(path)
+
+
+def main():
+    print("=" * 60)
+    print("  Government Securities PDF → Excel/CSV Extractor")
+    print("=" * 60)
+
+    # Find PDFs
+    pdf_files = sorted(glob.glob(os.path.join(PDF_FOLDER, "*.pdf")))
+    if not pdf_files:
+        print(f"\n❌  No PDF files found in '{os.path.abspath(PDF_FOLDER)}'")
+        print("   → Put your PDF report(s) in the same folder as this script and run again.")
+        return
+
+    print(f"\n📂  Found {len(pdf_files)} PDF file(s):")
+    for f in pdf_files:
+        print(f"    • {os.path.basename(f)}")
+
+    # Extract data from all PDFs
+    all_dfs = []
+    for pdf_path in pdf_files:
+        print(f"\n📄  Extracting: {os.path.basename(pdf_path)} ...")
+        try:
+            df = extract_tables_from_pdf(pdf_path)
+            if df.empty:
+                print(f"    ⚠️  No table data found — skipping.")
+            else:
+                print(f"    ✅  Extracted {len(df)} rows")
+                all_dfs.append(df)
+        except Exception as e:
+            print(f"    ❌  Error: {e}")
+
+    if not all_dfs:
+        print("\n❌  No data extracted from any PDF.")
+        print("   → Make sure the PDFs contain selectable (not scanned/image) tables.")
+        return
+
+    # Combine and clean
+    combined = pd.concat(all_dfs, ignore_index=True)
+    combined = clean_dataframe(combined)
+
+    print(f"\n📊  Total rows extracted: {len(combined)}")
+    print(f"    Columns: {list(combined.columns)}")
+
+    # ── Save CSV ──
+    combined.to_csv(OUTPUT_CSV, index=False)
+    print(f"\n✅  CSV saved  → {OUTPUT_CSV}")
+
+    # ── Save Excel ──
+    combined.to_excel(OUTPUT_EXCEL, index=False, sheet_name="Securities Data")
+    style_excel(OUTPUT_EXCEL)
+    print(f"✅  Excel saved → {OUTPUT_EXCEL}")
+
+    # ── Quick summary ──
+    print("\n─── Preview (first 5 rows) ───")
+    print(combined.head().to_string(index=False))
+
+    if "Security_Type" in combined.columns:
+        print("\n─── Counts by Security Type ───")
+        print(combined["Security_Type"].value_counts().to_string())
+
+    if "Weighted_Avg_Yield" in combined.columns and combined["Weighted_Avg_Yield"].notna().any():
+        print("\n─── Yield Summary ───")
+        print(combined["Weighted_Avg_Yield"].describe().to_string())
+
+    print("\n🎉  Done! Open the Excel file to use in Power BI.")
+
+
+if __name__ == "__main__":
+    main()
